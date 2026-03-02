@@ -5,6 +5,7 @@ from pathlib import Path
 import mdtraj
 import numpy as np
 import pandas as pd
+from Bio import Align
 from tqdm import tqdm
 
 from bioemu_benchmarks.benchmarks import Benchmark
@@ -12,6 +13,8 @@ from bioemu_benchmarks.logger import get_logger
 from bioemu_benchmarks.utils import StrPath, get_physical_traj_indices
 
 LOGGER = get_logger(__name__)
+
+_MIN_FUZZY_IDENTITY = 0.9
 
 
 @dataclass(frozen=True, eq=True)
@@ -89,17 +92,73 @@ def find_samples_in_dir(samples_dir: StrPath) -> list[SequenceSample]:
     return sequence_samples
 
 
+def _find_best_sequence_match(
+    sample_seq: str,
+    benchmark_sequences: set[str],
+    min_identity: float = _MIN_FUZZY_IDENTITY,
+) -> str | None:
+    """Find the best matching benchmark sequence for a sample sequence using pairwise alignment.
+
+    Args:
+        sample_seq: The sequence extracted from the sample PDB.
+        benchmark_sequences: Set of benchmark sequences to match against.
+        min_identity: Minimum sequence identity (0-1) required for a match.
+
+    Returns:
+        The best matching benchmark sequence, or None if no match exceeds the threshold.
+    """
+    aligner = Align.PairwiseAligner(mode="global", open_gap_score=-0.5)
+    best_match: str | None = None
+    best_identity: float = 0.0
+
+    for bench_seq in benchmark_sequences:
+        alignment = aligner.align(sample_seq, bench_seq)[0]
+        n_matches = alignment.counts().identities
+        identity = n_matches / max(len(sample_seq), len(bench_seq))
+        if identity > best_identity:
+            best_identity = identity
+            best_match = bench_seq
+
+    if best_identity >= min_identity:
+        return best_match
+    return None
+
+
 def select_relevant_samples(
     sequence_samples: list[SequenceSample], relevant_sequences: set[str]
-) -> list[SequenceSample]:
+) -> tuple[list[SequenceSample], dict[str, str]]:
+    """Select samples whose sequences match benchmark sequences (exact or fuzzy).
+
+    Returns:
+        A tuple of (filtered_samples, seq_mapping) where seq_mapping maps each
+        sample sequence to its matched benchmark sequence.
+    """
     seqs = [mdtraj.load_topology(ss.topology_file).to_fasta()[0] for ss in sequence_samples]
-    irrelevant_sequences_sampled = set(seqs).difference(relevant_sequences)
+
+    # Build mapping: sample_seq -> benchmark_seq
+    seq_mapping: dict[str, str] = {}
+    for seq in set(seqs):
+        if seq in relevant_sequences:
+            seq_mapping[seq] = seq
+        else:
+            match = _find_best_sequence_match(seq, relevant_sequences)
+            if match is not None:
+                seq_mapping[seq] = match
+                LOGGER.info(
+                    f"Fuzzy-matched sample sequence ({len(seq)} residues) to benchmark "
+                    f"sequence ({len(match)} residues) with {len(seq) - len(match):+d} residue difference."
+                )
+
+    irrelevant_sequences_sampled = set(seqs) - set(seq_mapping.keys())
     if irrelevant_sequences_sampled:
         LOGGER.info(
             f"Ignoring samples for {len(irrelevant_sequences_sampled)} irrelevant sequences."
         )
 
-    return [files for files, seq in zip(sequence_samples, seqs) if seq in relevant_sequences]
+    return (
+        [files for files, seq in zip(sequence_samples, seqs) if seq in seq_mapping],
+        seq_mapping,
+    )
 
 
 class IndexedSamples:
@@ -114,7 +173,9 @@ class IndexedSamples:
         benchmark_sequences = benchmark.metadata["sequence"]
 
         # Ignore irrelevant samples, i.e., samples of sequences that are not in the benchmark.
-        sequence_samples = select_relevant_samples(sequence_samples, set(benchmark_sequences))
+        sequence_samples, seq_mapping = select_relevant_samples(
+            sequence_samples, set(benchmark_sequences)
+        )
 
         sampled_sequences: set[str] = set()
         sequence_sample_to_test_cases: dict[SequenceSample, list[str]] = defaultdict(list)
@@ -126,8 +187,10 @@ class IndexedSamples:
 
             assert_topology_has_backbone_atoms(top)
 
+            # Use the mapped benchmark sequence for test case lookup
+            mapped_sequence = seq_mapping.get(sequence, sequence)
             assoc_test_cases = benchmark.metadata.loc[
-                benchmark.metadata["sequence"] == sequence
+                benchmark.metadata["sequence"] == mapped_sequence
             ].test_case
             if isinstance(assoc_test_cases, str):
                 sequence_sample_to_test_cases[sequence_sample].append(assoc_test_cases)
@@ -135,7 +198,7 @@ class IndexedSamples:
                 assert isinstance(assoc_test_cases, pd.Series)
                 sequence_sample_to_test_cases[sequence_sample].extend(assoc_test_cases)
 
-            sampled_sequences.add(sequence)
+            sampled_sequences.add(mapped_sequence)
 
         # Check if any relevant sequences have been sampled.
         if len(sampled_sequences) == 0:
